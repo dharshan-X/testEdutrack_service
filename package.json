@@ -1,0 +1,21 @@
+{
+  "name": "bullmq-tester",
+  "version": "1.0.0",
+  "description": "Universal CLI tool to test Redis connectivity and BullMQ queue health on any project",
+  "main": "index.js",
+  "bin": {
+    "bullmq-test": "./index.js",
+    "bqt": "./index.js"
+  },
+  "scripts": {
+    "test": "node index.js",
+    "test:redis": "node index.js --redis-only",
+    "test:queues": "node index.js --queues-only",
+    "test:roundtrip": "node index.js --roundtrip"
+  },
+  "dependencies": {
+    "bullmq": "^5.70.0",
+    "ioredis": "^5.9.2",
+    "chalk": "^4.1.2"
+  }
+}
