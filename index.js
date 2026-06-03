@@ -40,6 +40,9 @@ const BULLMQ_PREFIX = getArg('--prefix') || 'bull';
 const REDIS_ONLY = hasFlag('--redis-only');
 const QUEUES_ONLY = hasFlag('--queues-only');
 const ROUNDTRIP = hasFlag('--roundtrip');
+const LIVE = hasFlag('--live') || hasFlag('-l') || args.includes('live');
+const INTERVAL_ARG = getArg('--interval') || getArg('-i');
+const INTERVAL = parseInt(INTERVAL_ARG || '2', 10) * 1000;
 const HELP = hasFlag('--help') || hasFlag('-h');
 
 if (HELP) {
@@ -48,8 +51,11 @@ ${chalk.bold.cyan('BullMQ & Redis Tester')} — Universal CLI Tool
 
 ${chalk.yellow('Usage:')}
   node index.js [options]
+  node index.js live                  # Start live monitoring dashboard
 
 ${chalk.yellow('Options:')}
+  --live, -l         Live monitoring mode (scans and reports continuously)
+  --interval, -i <s >Interval in seconds for live mode (default: 2)
   --redis-only       Test Redis connectivity and cache ops only
   --queues-only      Test BullMQ queue health only
   --roundtrip        Full roundtrip test (add job → consume → verify)
@@ -64,10 +70,10 @@ ${chalk.yellow('Environment variables:')}
   REDIS_HOST, REDIS_PORT, REDIS_PASSWORD, REDIS_DB
 
 ${chalk.yellow('Examples:')}
-  node index.js                                  # Test local Redis
-  node index.js --host 192.168.1.50 --port 6380  # Remote Redis
-  node index.js --queues-only                    # Only check queues
-  node index.js --roundtrip                      # Full lifecycle test
+  node index.js                                  # Test local Redis once
+  node index.js live                             # Live monitoring at 127.0.0.1
+  node index.js --live -i 5 --host 192.168.1.50  # Live monitoring every 5s on remote Redis
+  node index.js --queues-only                    # Only check queues once
 `);
   process.exit(0);
 }
@@ -869,9 +875,208 @@ async function testRedisKeysScan() {
   }
 }
 
+// ─── Live Monitoring Mode ────────────────────────────────────────────────────
+
+async function startLiveMode() {
+  const startTime = Date.now();
+  let iterations = 0;
+
+  // Listen for Ctrl+C to exit gracefully
+  process.on('SIGINT', () => {
+    console.clear();
+    console.log(chalk.cyan.bold('\n  Live monitoring stopped. Goodbye!\n'));
+    process.exit(0);
+  });
+
+  const SPINNER_FRAMES = ['⠋', '⠙', '⠹', '⠸', '⠼', '⠴', '⠦', '⠧', '⠇', '⠏'];
+
+  while (true) {
+    iterations++;
+    console.clear();
+    const elapsedSeconds = Math.round((Date.now() - startTime) / 1000);
+    const spinner = SPINNER_FRAMES[iterations % SPINNER_FRAMES.length];
+
+    console.log(chalk.cyan.bold('╔═══════════════════════════════════════════════════════════════════╗'));
+    console.log(chalk.cyan.bold('║         BullMQ & Redis Tester — Live Monitoring Dashboard         ║'));
+    console.log(chalk.cyan.bold('╚═══════════════════════════════════════════════════════════════════╝'));
+    console.log(chalk.gray(`  Target: redis://${REDIS_HOST}:${REDIS_PORT}/${REDIS_DB}   |   Last Scan: ${new Date().toLocaleTimeString()} ${chalk.cyan(spinner)}`));
+    console.log(chalk.gray(`  Interval: ${INTERVAL / 1000}s   |   Uptime: ${formatUptime(elapsedSeconds)}   |   Scan #${iterations}   |   PID: ${process.pid}`));
+    console.log(chalk.gray(`  Press Ctrl+C to exit`));
+    console.log(chalk.cyan('─'.repeat(68)));
+
+    const redis = new Redis({
+      ...REDIS_CONNECTION,
+      lazyConnect: true,
+      connectTimeout: 2000,
+      maxRetriesPerRequest: 1,
+      retryStrategy: () => null,
+    });
+
+    let redisOk = false;
+    let redisVersion = 'Unknown';
+    let redisMem = 'Unknown';
+    let redisClients = 'Unknown';
+    let queueNames = [];
+
+    try {
+      await redis.connect();
+      const pong = await redis.ping();
+      if (pong === 'PONG') {
+        redisOk = true;
+      }
+
+      const infoStr = await redis.info();
+      redisVersion = infoStr.match(/redis_version:(.+)/)?.[1]?.trim() || 'Unknown';
+      redisMem = infoStr.match(/used_memory_human:(.+)/)?.[1]?.trim() || 'Unknown';
+      redisClients = infoStr.match(/connected_clients:(\d+)/)?.[1] || 'Unknown';
+
+      // Scan for queues
+      const discoveredSet = new Set();
+      let cursor = '0';
+      do {
+        const [nextCursor, keys] = await redis.scan(cursor, 'MATCH', `${BULLMQ_PREFIX}:*:meta`, 'COUNT', 250);
+        cursor = nextCursor;
+        for (const key of keys) {
+          const parts = key.split(':');
+          if (parts.length >= 3) discoveredSet.add(parts[1]);
+        }
+      } while (cursor !== '0');
+
+      if (discoveredSet.size === 0) {
+        cursor = '0';
+        do {
+          const [nextCursor, keys] = await redis.scan(cursor, 'MATCH', `${BULLMQ_PREFIX}:*:id`, 'COUNT', 250);
+          cursor = nextCursor;
+          for (const key of keys) {
+            const parts = key.split(':');
+            if (parts.length >= 3) discoveredSet.add(parts[1]);
+          }
+        } while (cursor !== '0');
+      }
+
+      queueNames = [...discoveredSet].sort();
+    } catch (err) {
+      redisOk = false;
+    }
+
+    if (!redisOk) {
+      console.log(`  Redis Status: ${chalk.red.bold('✗ OFFLINE')} (Cannot reach Redis at ${REDIS_HOST}:${REDIS_PORT})`);
+      console.log(chalk.yellow(`  Retrying in ${INTERVAL / 1000} seconds...\n`));
+      try { await redis.quit(); } catch {}
+      await sleep(INTERVAL);
+      continue;
+    }
+
+    console.log(`  Redis Status: ${chalk.green.bold('● ONLINE')}   Version: ${chalk.white.bold(redisVersion)}   Memory: ${chalk.white.bold(redisMem)}   Clients: ${chalk.white.bold(redisClients)}`);
+    console.log(chalk.cyan('─'.repeat(68)));
+
+    if (queueNames.length === 0) {
+      console.log(`\n  ${chalk.yellow('No BullMQ queues found in Redis.')}`);
+      console.log(chalk.gray(`  (Looked for keys matching prefix: "${BULLMQ_PREFIX}")`));
+    } else {
+      console.log(chalk.bold(`  Discovered Queues (${queueNames.length}):`));
+      console.log('');
+      console.log(chalk.gray(
+        `  ${pad('Queue Name', 24)} ${pad('Wait', 6)} ${pad('Active', 6)} ${pad('Delay', 6)} ${pad('Failed', 6)} ${pad('Done', 6)} Status`
+      ));
+      console.log(chalk.gray('  ' + '─'.repeat(68)));
+
+      const queuesWithFailures = [];
+      const queuesWithWarnings = [];
+
+      for (const name of queueNames) {
+        // Reuse redis client for queue queries to avoid connection bloat
+        const q = new Queue(name, { connection: redis, prefix: BULLMQ_PREFIX });
+        q.on('error', () => {});
+
+        try {
+          const [waiting, active, delayed, failed, completed] = await Promise.all([
+            q.getWaitingCount(),
+            q.getActiveCount(),
+            q.getDelayedCount(),
+            q.getFailedCount(),
+            q.getCompletedCount(),
+          ]);
+
+          let status;
+          if (failed > 0) {
+            status = chalk.red('● FAILURES');
+            queuesWithFailures.push({ name, waiting, active, delayed, failed, completed, queue: q });
+          } else if (active > 0) {
+            status = chalk.green('● ACTIVE');
+            queuesWithWarnings.push({ name, waiting, active, delayed, failed, completed, queue: q, reason: 'active' });
+          } else if (waiting > 0 || delayed > 0) {
+            status = chalk.yellow('● PENDING');
+            queuesWithWarnings.push({ name, waiting, active, delayed, failed, completed, queue: q, reason: 'pending' });
+          } else {
+            status = chalk.gray('○ IDLE');
+            try { await q.close(); } catch {}
+          }
+
+          console.log(
+            `  ${pad(name, 24)} ${pad(String(waiting), 6)} ${pad(String(active), 6)} ${pad(String(delayed), 6)} ${pad(String(failed), 6)} ${pad(String(completed), 6)} ${status}`
+          );
+        } catch (err) {
+          console.log(`  ${pad(name, 24)} ${chalk.red('ERROR: ' + err.message.substring(0, 30))}`);
+          try { await q.close(); } catch {}
+        }
+      }
+
+      // Compact failed job summaries (to avoid taking up the whole screen)
+      if (queuesWithFailures.length > 0) {
+        console.log('');
+        console.log(chalk.red.bold('  ── LATEST FAILURES ────────────────────────────────────────────────'));
+        let failureCount = 0;
+        for (const qi of queuesWithFailures) {
+          if (failureCount >= 3) {
+            try { await qi.queue.close(); } catch {}
+            continue;
+          }
+          try {
+            const failedJobs = await qi.queue.getFailed(0, 1);
+            if (failedJobs.length > 0) {
+              const fj = failedJobs[0];
+              const age = fj.timestamp ? formatUptime(Math.round((Date.now() - fj.timestamp) / 1000)) : 'unknown';
+              console.log(`  ${chalk.red('•')} ${chalk.white.bold(qi.name)} (Job #${fj.id || 'N/A'}: "${fj.name || 'N/A'}")`);
+              console.log(`    ${chalk.gray('Error:')} ${chalk.red.bold(fj.failedReason || 'Unknown error')}`);
+              console.log(`    ${chalk.gray('Failed:')} ${age} ago | ${chalk.gray('Payload:')} ${chalk.yellow(JSON.stringify(fj.data).substring(0, 80))}`);
+              failureCount++;
+            }
+          } catch {}
+          try { await qi.queue.close(); } catch {}
+        }
+      }
+
+      // Compact warnings summaries (waiting/delayed with no worker)
+      const idleQueuesWithJobs = queuesWithWarnings.filter(w => w.reason === 'pending');
+      if (idleQueuesWithJobs.length > 0) {
+        console.log('');
+        console.log(chalk.yellow.bold('  ── QUEUES WITH NO WORKERS ─────────────────────────────────────────'));
+        let warningCount = 0;
+        for (const qi of idleQueuesWithJobs) {
+          if (warningCount >= 3) {
+            try { await qi.queue.close(); } catch {}
+            continue;
+          }
+          console.log(`  ${chalk.yellow('•')} ${chalk.white.bold(qi.name)} has ${chalk.yellow(qi.waiting)} waiting and ${chalk.cyan(qi.delayed)} delayed jobs but no active worker.`);
+          warningCount++;
+          try { await qi.queue.close(); } catch {}
+        }
+      }
+    }
+
+    try { await redis.quit(); } catch {}
+    await sleep(INTERVAL);
+  }
+}
+
 // ─── Main ────────────────────────────────────────────────────────────────────
 
 async function main() {
+  if (LIVE) {
+    await startLiveMode();
+    return;
+  }
   console.log('');
   console.log(chalk.cyan.bold('╔═══════════════════════════════════════════════════════════════════╗'));
   console.log(chalk.cyan.bold('║           BullMQ & Redis Tester — Universal CLI Tool             ║'));
